@@ -16,8 +16,54 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # Pydantic model for incoming sequence data
 class SequenceUpload(BaseModel):
-    name: str
     sequence: str
+
+@router.get("/")
+def list_sequences():
+    """
+    List available DNA sequences stored in the data folder.
+    Returns id, preview (first bases), length, and whether a compressed file exists.
+    """
+    items = []
+    for file in os.listdir(DATA_DIR):
+        if file.endswith(".txt"):
+            path = os.path.join(DATA_DIR, file)
+            # support both legacy id_name.txt and new id.txt
+            filename_no_ext = file[:-4]
+            if "_" in filename_no_ext:
+                seq_id = filename_no_ext.split("_", 1)[0]
+            else:
+                seq_id = filename_no_ext
+            # read to get length
+            try:
+                with open(path, "r") as f:
+                    sequence = f.read().strip().upper()
+                length = len(sequence)
+                preview = sequence[:20] + ("..." if length > 20 else "")
+            except Exception:
+                length = None
+                preview = None
+            # compressed exists?
+            compressed_exists = os.path.exists(path + ".gz")
+            items.append({
+                "id": seq_id,
+                "preview": preview,
+                "length": length,
+                "compressed": compressed_exists
+            })
+    # sort by newest first (by file mtime desc)
+    def mtime_for(item):
+        # prefer new pattern id.txt; fallback to any matching legacy file
+        path_new = os.path.join(DATA_DIR, f"{item['id']}.txt")
+        if os.path.exists(path_new):
+            return os.path.getmtime(path_new)
+        # find any file starting with id_
+        for f in os.listdir(DATA_DIR):
+            if f.startswith(item['id'] + "_") and f.endswith('.txt'):
+                return os.path.getmtime(os.path.join(DATA_DIR, f))
+        return 0
+    items.sort(key=mtime_for, reverse=True)
+    return {"items": items}
 
 @router.post("/")
 def upload_sequence(payload: SequenceUpload):
@@ -26,7 +72,7 @@ def upload_sequence(payload: SequenceUpload):
     """
     # generate a unique ID for the sequence
     seq_id = str(uuid.uuid4())[:8]
-    file_path = os.path.join(DATA_DIR, f"{seq_id}_{payload.name}.txt")
+    file_path = os.path.join(DATA_DIR, f"{seq_id}.txt")
 
     # simple validation
     seq = payload.sequence.upper()
@@ -39,10 +85,109 @@ def upload_sequence(payload: SequenceUpload):
 
     return {
         "id": seq_id,
-        "name": payload.name,
         "length": len(seq),
         "message": "Sequence uploaded successfully"
     }
+
+@router.get("/{seq_id}")
+def get_sequence(seq_id: str):
+    """
+    Return the full stored DNA sequence for a given id and its length.
+    Supports both new pattern `id.txt` and legacy `id_*.txt`.
+    """
+    # try new pattern first
+    candidate = os.path.join(DATA_DIR, f"{seq_id}.txt")
+    sequence_file = None
+    if os.path.exists(candidate):
+        sequence_file = candidate
+    else:
+        # search legacy
+        for f in os.listdir(DATA_DIR):
+            if f.startswith(seq_id + "_") and f.endswith('.txt'):
+                sequence_file = os.path.join(DATA_DIR, f)
+                break
+
+    if not sequence_file:
+        raise HTTPException(status_code=404, detail="Sequence file not found for this ID.")
+
+    with open(sequence_file, "r") as f:
+        sequence = f.read().strip().upper()
+
+    return {
+        "id": seq_id,
+        "sequence": sequence,
+        "length": len(sequence)
+    }
+
+class SequenceUpdate(BaseModel):
+    sequence: str
+
+@router.put("/{seq_id}")
+def update_sequence(seq_id: str, payload: SequenceUpdate):
+    """
+    Replace the stored DNA sequence for a given id (overwrites .txt, removes old .gz if exists).
+    Supports both new pattern `id.txt` and legacy `id_*.txt`; will write back to `id.txt`.
+    """
+    # ensure data dir
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # remove any legacy txts for this id
+    for f in os.listdir(DATA_DIR):
+        if (f == f"{seq_id}.txt") or (f.startswith(seq_id + "_") and f.endswith('.txt')):
+            try:
+                os.remove(os.path.join(DATA_DIR, f))
+            except FileNotFoundError:
+                pass
+
+    # write new sequence
+    seq = payload.sequence.upper()
+    if not all(base in "ATCG" for base in seq):
+        raise HTTPException(status_code=400, detail="Invalid DNA sequence. Use only A, T, C, G.")
+    path_new = os.path.join(DATA_DIR, f"{seq_id}.txt")
+    with open(path_new, 'w') as f:
+        f.write(seq)
+
+    # remove any gz for this id (since content changed)
+    gz_new = path_new + '.gz'
+    if os.path.exists(gz_new):
+        try:
+            os.remove(gz_new)
+        except FileNotFoundError:
+            pass
+    # also remove any legacy gz
+    for f in os.listdir(DATA_DIR):
+        if f.startswith(seq_id) and f.endswith('.gz'):
+            try:
+                os.remove(os.path.join(DATA_DIR, f))
+            except FileNotFoundError:
+                pass
+
+    return {"id": seq_id, "length": len(seq), "message": "Sequence updated successfully"}
+
+@router.delete("/{seq_id}")
+def delete_sequence(seq_id: str):
+    """
+    Delete the stored DNA sequence (both .txt and any .gz) for a given id.
+    """
+    found = False
+    # delete txts
+    for f in os.listdir(DATA_DIR):
+        if (f == f"{seq_id}.txt") or (f.startswith(seq_id + "_") and f.endswith('.txt')):
+            try:
+                os.remove(os.path.join(DATA_DIR, f))
+                found = True
+            except FileNotFoundError:
+                pass
+    # delete gz
+    for f in os.listdir(DATA_DIR):
+        if f.startswith(seq_id) and f.endswith('.gz'):
+            try:
+                os.remove(os.path.join(DATA_DIR, f))
+            except FileNotFoundError:
+                pass
+    if not found:
+        raise HTTPException(status_code=404, detail="Sequence file not found for this ID.")
+    return {"id": seq_id, "message": "Sequence deleted"}
 
 @router.post("/{seq_id}/compress")
 def compress_sequence(seq_id: str):
